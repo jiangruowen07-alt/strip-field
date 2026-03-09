@@ -1,0 +1,50 @@
+# 初始向量场绘制 - 修改记录
+
+## 一、运算速度优化（优化到运算最快速）
+
+### 1.1 预计算与缓存
+- 新增常量 `T_STEP = 0.02`、`T_COUNT = 51`，统一采样步长
+- 新增 `_precompute_parametric_arrays()`：对参数化母线（直线/正弦/弧线）一次性预计算 51 个 t 值对应的 (x, y, 切向, 法向)
+- 新增 `_precompute_custom_curve_arrays()`：对手绘母线只做一次 Catmull-Rom 采样，按弧长插值得到 51 个点及向量
+
+### 1.2 消除重复计算
+- **原逻辑**：每个 t 调用 `_get_seed_point_for_curve` 和 `_get_line_vectors_for_curve`，每次重新采样曲线
+- **现逻辑**：每条母线只采样一次，生成预计算数组，后续通过索引直接取值
+
+### 1.3 draw_result 优化
+- Cross Streets：`sorted(lines)` 只排序一次，移出循环
+- 点查找：用 `line[idx]` 直接索引替代 `next((lp for lp in line if lp["t"] >= t), ...)` 的 O(n) 遍历
+- Parcel Blocks：同样改为按索引直接取点
+
+### 1.4 热循环优化
+- 在循环内提前取出 `fieldType`、`noiseEnabled` 等，减少字典查找
+
+---
+
+## 二、道路疏密控制（每条母线分开控制）
+
+### 2.1 全局控制（非 Custom 模式）
+- STREET & PARCEL 中的 Cross Road Spacing 控制单条参数化母线的道路疏密
+
+### 2.2 每条母线单独控制（Custom 模式）
+- 在 `_get_curve_params_defaults()` 中新增 `crossSpacing` 参数
+- 在母线参数面板（CURVE VECTOR PARAMS）中新增「道路疏密」滑块（20–300）
+- 点击某条母线的 Params 后，可单独调节该母线的道路疏密
+- 新建母线时，默认使用全局 Cross Road Spacing 的当前值
+
+### 2.3 疏密计算逻辑
+- 数值越小：横向道路越密（更多交叉路）
+- 数值越大：横向道路越疏（更少交叉路）
+- 公式：`num_sections = max(3, min(51, int(1600 / crossSpacing)))`
+
+### 2.4 数据流
+- `generate()` 为每条母线收集 `cross_spacings`
+- Custom：从 `curve["params"]["crossSpacing"]` 读取
+- 非 Custom：使用 `state["crossSpacing"]`
+- `draw_result(lines_by_curve, cross_spacings)` 按曲线索引使用对应疏密值
+
+---
+
+## 三、涉及文件
+
+- `urban_field_gen.py`：主程序，包含上述全部修改
