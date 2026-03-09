@@ -1,0 +1,200 @@
+================================================================================
+strip-field 今日改动 (2025-03-09)
+================================================================================
+
+【Git 状态】
+- 分支: master (与 origin/master 同步)
+- 已修改: README.md, app.py, config.py, engines/offset_field_engine.py, field_generator.py, geom.py, i18n.py
+- 新增未跟踪: parcel_subdivision.py, street_network.py
+
+================================================================================
+【修改文件 diff】
+================================================================================
+
+--- README.md ---
+- 街道与地块参数：横向道路间距、地块最小/最大尺寸、地块深度偏移
++ 街道与地块参数：横向道路间距、地块最小/最大面宽、最小面积、最大进深
++ 地块划分模式：临街面切分、按块切分、转角地块单独、不规则扰动（可单独开关）
++ 道路等级：primary / secondary / local，主骨架更明显
++ 自适应横街：根据曲率、吸引子距离、地价价值决定横街密度，不再固定 t 采样
+
++ parcel_subdivision.py # 地块划分（frontage-based、block-by-block、转角、扰动）
++ street_network.py    # 街道网络（道路等级、自适应横街）
+
+--- config.py ---
++ # 画布边距：地块外显示母线控制点
++ DRAW_PADDING = 150
+
+--- engines/offset_field_engine.py ---
+- from_state(cls, state): 从 app state 创建
++ from_state(cls, state, params=None): params 可覆盖 fieldType（用于每条母线单独设置场类型）
+
+--- field_generator.py ---
+- params 可覆盖 state 中的参数（用于单条母线自定义参数）
++ params 可覆盖 state 中的参数（用于单条母线自定义参数，含 fieldType）
+- engine = OffsetFieldEngine.from_state(state)
++ engine = OffsetFieldEngine.from_state(state, params)
+
+--- geom.py ---
++ split_segment_inside_outside(p0, p1, xmin, ymin, xmax, ymax)
++ 将线段按矩形边界分割为内部/外部部分，用于画布内实线、画布外虚线
+
+--- i18n.py ---
+- parcel_min: Parcel Min / 地块最小
+- parcel_max: Parcel Max / 地块最大
++ parcel_min: Min Frontage / 最小面宽
++ parcel_max: Max Frontage / 最大面宽
++ parcel_min_area: Min Area / 最小面积
++ parcel_max_depth: Max Depth / 最大进深
++ ROAD_HIERARCHY, ADAPTIVE_CROSS, CURVATURE_WEIGHT, ATTRACTOR_WEIGHT, VALUE_WEIGHT
++ PARCEL_FRONTAGE_BASED, PARCEL_BLOCK_BY_BLOCK, PARCEL_CORNER_SEPARATE, PARCEL_PERTURBATION
+
+--- app.py 主要改动 ---
++ 导入 parcel_subdivision, street_network, geom.split_segment_inside_outside, config.DRAW_PADDING
++ UI: 道路等级勾选、自适应横街勾选、曲率/吸引子/价值权重滑块
++ UI: 地块参数改为 最小面宽/最大面宽/最小面积/最大进深
++ UI: 地块划分模式勾选（临街面、按块、转角、扰动+强度）
++ 曲线编辑: 每条母线可单独设置 fieldType
++ 画布: DRAW_PADDING 边距，_pad/_unpad 坐标转换，_draw_line_segment 内外虚实线
++ generate: curve_arrays_by_curve 传递，自适应横街 t_positions
++ draw_result: 道路等级 hierarchy_style，subdivide_blocks/rule_based_parcels 地块划分
+
+================================================================================
+【新增文件 parcel_subdivision.py】
+================================================================================
+
+"""
+地块划分：frontage-based、block-by-block、转角地块、不规则扰动
+- 基于临街面划分
+- 按 block 逐块切分
+- 转角地块单独处理
+- 最小面积、最小面宽、最大进深控制
+"""
+
+import math
+import random
+
+from config import T_COUNT, T_STEP
+
+
+def polygon_area(pts):
+    """多边形面积（Shoelace）"""
+    if len(pts) < 3:
+        return 0.0
+    n = len(pts)
+    area = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        area += pts[i][0] * pts[j][1]
+        area -= pts[j][0] * pts[i][1]
+    return abs(area) / 2.0
+
+
+def segment_length(p0, p1):
+    return math.sqrt((p1[0] - p0[0]) ** 2 + (p1[1] - p0[1]) ** 2)
+
+
+def polygon_frontage(pts):
+    """临街面（四边形取较短的两条对边中较短者，作为典型面宽）"""
+    if len(pts) < 4:
+        return segment_length(pts[0], pts[-1]) if len(pts) >= 2 else 0.0
+    e0 = segment_length(pts[0], pts[1])
+    e1 = segment_length(pts[1], pts[2])
+    e2 = segment_length(pts[2], pts[3])
+    e3 = segment_length(pts[3], pts[0])
+    front_back = min(e0, e2)
+    left_right = min(e1, e3)
+    return min(front_back, left_right)
+
+
+def subdivide_block_frontage_based(corners, min_frontage, max_frontage):
+    """前边(p1-p2)为临街面，沿该面切分"""
+    p1, p2, p3, p4 = corners
+    frontage_len = segment_length(p1, p2)
+    if frontage_len < 1e-10:
+        return [corners] if polygon_area(corners) > 1e-12 else []
+    target = max(min_frontage, (min_frontage + max_frontage) / 2)
+    n = max(1, min(50, int(math.ceil(frontage_len / max(target, 1)))))
+    parcels = []
+    for i in range(n):
+        t0, t1 = i / n, (i + 1) / n
+        a = lerp_point(p1, p2, t0)
+        b = lerp_point(p1, p2, t1)
+        c = lerp_point(p4, p3, t1)
+        d = lerp_point(p4, p3, t0)
+        parcel_pts = [a, b, c, d]
+        if polygon_area(parcel_pts) > 1e-12:
+            parcels.append(parcel_pts)
+    return parcels
+
+
+def subdivide_blocks(sorted_lines, t_positions, min_frontage=15, max_frontage=45,
+    min_area=50, max_depth=1e9, use_frontage_based=True, use_block_by_block=True,
+    corner_parcels_separate=True, perturbation_strength=0, seed=None):
+    """主入口：按 block 划分地块"""
+    parcels = []
+    rng = random.Random(seed)
+    for i in range(len(sorted_lines) - 1):
+        line_a, line_b = sorted_lines[i], sorted_lines[i + 1]
+        for j in range(len(t_positions) - 1):
+            t_start, t_end = t_positions[j], t_positions[j + 1]
+            corners = get_block_corners(line_a, line_b, t_start, t_end)
+            if polygon_area(corners) < 1e-12:
+                continue
+            is_corner = is_corner_block(t_start, t_end, t_positions)
+            if corner_parcels_separate and is_corner:
+                block_parcels = subdivide_corner_block(corners, min_frontage, max_frontage)
+            elif use_frontage_based:
+                block_parcels = subdivide_block_frontage_based(corners, min_frontage, max_frontage)
+            else:
+                block_parcels = [corners]
+            for p in block_parcels:
+                if perturbation_strength > 0:
+                    p = apply_perturbation(p, perturbation_strength, seed=rng.random())
+                parcels.append(p)
+    return filter_parcels_by_constraints(parcels, min_area=min_area, min_frontage=min_frontage, max_depth=max_depth)
+
+
+def rule_based_parcels(sorted_lines, segments=15):
+    """原有规则切片逻辑（兼容旧行为）"""
+    parcels = []
+    for i in range(len(sorted_lines) - 1):
+        line_a, line_b = sorted_lines[i], sorted_lines[i + 1]
+        for seg in range(segments):
+            t_start = seg / segments
+            t_end = (seg + 0.8) / segments
+            idx_s = 0 if t_start <= 0 else min(int(t_start / T_STEP) + 1, T_COUNT - 1)
+            idx_e = 0 if t_end <= 0 else min(int(t_end / T_STEP) + 1, T_COUNT - 1)
+            p1, p2 = line_a[idx_s], line_b[idx_s]
+            p3, p4 = line_b[idx_e], line_a[idx_e]
+            parcel_pts = [(p1["x"],p1["y"]),(p2["x"],p2["y"]),(p3["x"],p3["y"]),(p4["x"],p4["y"])]
+            parcels.append(parcel_pts)
+    return parcels
+
+================================================================================
+【新增文件 street_network.py】
+================================================================================
+
+"""
+街道网络：道路等级、自适应横街
+- 道路等级：primary / secondary / local
+- 横街不再固定 t 采样，由曲率、密度、价值、吸引子距离决定
+"""
+
+ROAD_PRIMARY, ROAD_SECONDARY, ROAD_LOCAL
+
+def curvature_at_index(xs, ys, i):  # 离散曲率 Menger 近似
+def curvature_along_curve(xs, ys):  # 沿曲线采样曲率
+def attractor_influence(x, y, center_x, center_y, sigma):  # 吸引子影响
+def value_at_point(x, y, value_field):  # 标量场价值
+def t_to_index(t):  # t 转数组索引
+def adaptive_cross_t_positions(xs, ys, lines, base_spacing=80, curvature_weight=0.4,
+    attractor_weight=0.3, value_weight=0.2, ...):  # 自适应横街 t 位置
+def classify_longitudinal_hierarchy(lines):  # 纵向线道路等级
+def get_line_at_t(lines, t, perp=True):  # t 处采样横街
+def hierarchy_style(level):  # primary→2.5/#e8e8e8, secondary→1.5/#b3b3b3, local→0.8/#666666
+
+================================================================================
+【完整 diff】
+运行 `git diff` 可查看完整代码差异
+================================================================================

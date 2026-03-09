@@ -111,7 +111,7 @@ def generate_lines_from_arrays(arr, state, params=None):
     """
     从预计算数组生成扩张线。
     使用 OffsetFieldEngine，保留原有 7 种模式逻辑。
-    params 可覆盖 state 中的参数（用于单条母线自定义参数）
+    params 可覆盖 state 中的参数（用于单条母线自定义参数，含 fieldType）
     """
-    engine = OffsetFieldEngine.from_state(state)
+    engine = OffsetFieldEngine.from_state(state, params)
     return engine.generate_lines(arr, state, params)

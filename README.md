@@ -25,7 +25,10 @@
 - **种子线类型**：直线、正弦波、弧线/曲线
 - **扩张参数**：线间距、正负向数量、间距模式（线性 / 指数 / 斐波那契）、间距缩放
 - **噪声与扰动**：可选的噪声扭曲，支持调节噪声尺度与强度
-- **街道与地块参数**：横向道路间距、地块最小/最大尺寸、地块深度偏移
+- **街道与地块参数**：横向道路间距、地块最小/最大面宽、最小面积、最大进深
+- **地块划分模式**：临街面切分、按块切分、转角地块单独、不规则扰动（可单独开关）
+- **道路等级**：primary / secondary / local，主骨架更明显
+- **自适应横街**：根据曲率、吸引子距离、地价价值决定横街密度，不再固定 t 采样
 
 ## 环境要求
 
@@ -57,11 +60,13 @@ python main.py
 strip-field/
 ├── main.py              # 程序入口
 ├── app.py               # 主应用类 UrbanFieldGenerator（UI + 逻辑编排）
+├── parcel_subdivision.py # 地块划分（frontage-based、block-by-block、转角、扰动）
 ├── config.py            # 配置常量（T_STEP, T_COUNT）
 ├── utils.py             # 工具函数（lerp, noise, safe_float, safe_int）
 ├── geom.py              # 几何裁剪（线段/折线/多边形裁剪到矩形）
 ├── curve.py             # 曲线插值（Catmull-Rom 样条、弧长采样）
 ├── field_generator.py   # 向量场生成逻辑（预计算、扩张线生成）
+├── street_network.py    # 街道网络（道路等级、自适应横街）
 ├── engines/             # 向量场引擎模块
 │   ├── offset_field_engine.py   # A. OffsetFieldEngine（原有 7 种模式）
 │   ├── blended_field_engine.py  # B. BlendedFieldEngine（多母线叠加、距离衰减、切向/法向混合）

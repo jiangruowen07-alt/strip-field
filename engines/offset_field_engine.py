@@ -53,10 +53,11 @@ class OffsetFieldEngine:
         self.noise_strength = noise_strength
 
     @classmethod
-    def from_state(cls, state):
-        """从 app state 创建"""
-        ft = state.get("fieldType", "1")
-        mode = _mode_from_field_type(ft)
+    def from_state(cls, state, params=None):
+        """从 app state 创建，params 可覆盖 fieldType（用于每条母线单独设置场类型）"""
+        ft = (params.get("fieldType", state.get("fieldType", "1")) if params
+              else state.get("fieldType", "1"))
+        mode = _mode_from_field_type(str(ft))
         # 若选 7 则强制 noise_modified 模式，否则用 noiseEnabled 决定是否叠加噪声
         if mode == MODE_NOISE_MODIFIED:
             return cls(mode=mode, noise_enabled=True,

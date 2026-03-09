@@ -94,6 +94,49 @@ def clip_polyline_to_rect(pts, xmin, ymin, xmax, ymax):
     return [p for p in result if len(p) >= 2]
 
 
+def split_segment_inside_outside(p0, p1, xmin, ymin, xmax, ymax):
+    """
+    将线段按矩形边界分割为内部/外部部分。
+    返回 [(inside, [(x,y),(x,y)]), (outside, [(x,y),(x,y)]), ...]
+    """
+    x0, y0 = p0
+    x1, y1 = p1
+    dx, dy = x1 - x0, y1 - y0
+
+    def inside(px, py):
+        return xmin <= px <= xmax and ymin <= py <= ymax
+
+    t_values = [0.0, 1.0]
+    if abs(dx) > 1e-12:
+        for x in (xmin, xmax):
+            t = (x - x0) / dx
+            if 0 < t < 1:
+                py = y0 + t * dy
+                if ymin <= py <= ymax:
+                    t_values.append(t)
+    if abs(dy) > 1e-12:
+        for y in (ymin, ymax):
+            t = (y - y0) / dy
+            if 0 < t < 1:
+                px = x0 + t * dx
+                if xmin <= px <= xmax:
+                    t_values.append(t)
+    t_values = sorted(set(t_values))
+
+    result = []
+    for i in range(len(t_values) - 1):
+        ta, tb = t_values[i], t_values[i + 1]
+        mid_t = (ta + tb) / 2
+        mx = x0 + mid_t * dx
+        my = y0 + mid_t * dy
+        seg = [(x0 + ta * dx, y0 + ta * dy), (x0 + tb * dx, y0 + tb * dy)]
+        if inside(mx, my):
+            result.append(("inside", seg))
+        else:
+            result.append(("outside", seg))
+    return result
+
+
 def clip_polygon_to_rect(pts, xmin, ymin, xmax, ymax):
     """Sutherland-Hodgman 多边形裁剪到矩形，返回裁剪后的多边形列表"""
     if len(pts) < 3:

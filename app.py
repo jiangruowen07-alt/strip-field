@@ -8,7 +8,7 @@ from tkinter import ttk, filedialog
 import math
 import random
 
-from config import T_COUNT, T_STEP
+from config import T_COUNT, T_STEP, DRAW_PADDING
 from utils import safe_float, safe_int
 from curve import sample_curve
 from field_generator import (
@@ -22,6 +22,16 @@ from field_generator import (
 )
 from engines.scalar_field_engine import default_land_price_field
 from exporter import export_rhino, export_dxf
+from geom import split_segment_inside_outside
+from street_network import (
+    adaptive_cross_t_positions,
+    classify_longitudinal_hierarchy,
+    get_line_at_t,
+    hierarchy_style,
+    ROAD_PRIMARY,
+    ROAD_SECONDARY,
+    ROAD_LOCAL,
+)
 from i18n import T, RUN_MODE_OPTS, ENGINE_OPTS, FIELD_TYPE_OPTS, SEED_TYPE_OPTS, SPACING_MODE_OPTS
 from i18n import INTEGRATE_METHOD_OPTS, BTN_ADD_CURVE, BTN_DRAW, BTN_DONE_DRAWING, BTN_CLEAR, BTN_RESET, BTN_GENERATE
 from i18n import BTN_PARAMS, BTN_EDIT, BTN_DEL, BLEND_PARAMS_TITLE, BLEND_TANGENT, BLEND_NORMAL, BLEND_DECAY
@@ -29,7 +39,10 @@ from i18n import BLEND_RADIUS, BLEND_HINT, SCALAR_PARAMS_TITLE, SCALAR_METHOD, S
 from i18n import SCALAR_CENTER_X, SCALAR_CENTER_Y, SCALAR_SIGMA, OFFSET_HINT, MULTI_SEED_HINT, CURVE_PARAMS_HINT
 from i18n import CURVE_SELECT_HINT, LINE_SPACING_SHORT, POS_NEG, OFFSET_XY, SPACING_MODE_SHORT
 from i18n import SPACING_SCALE_SHORT, CROSS_SPACING_SHORT, NOISE_ENABLED, ROADS_PERP, NO_CURVES_YET
-from i18n import DRAW_MODE_STATUS, CURVE_SPACING_MODES, SEED_TYPE_OPTS, curve_n_params, curve_n_pts
+from i18n import ROAD_HIERARCHY, ADAPTIVE_CROSS, CURVATURE_WEIGHT, ATTRACTOR_WEIGHT, VALUE_WEIGHT
+from i18n import PARCEL_FRONTAGE_BASED, PARCEL_BLOCK_BY_BLOCK, PARCEL_CORNER_SEPARATE, PARCEL_PERTURBATION
+from i18n import PARCEL_PERTURBATION_STR, DRAW_MODE_STATUS, CURVE_SPACING_MODES, SEED_TYPE_OPTS, curve_n_params, curve_n_pts
+from parcel_subdivision import subdivide_blocks, rule_based_parcels
 
 
 class UrbanFieldGenerator:
@@ -50,6 +63,8 @@ class UrbanFieldGenerator:
         self._canvas_custom_bound = False
         self._curve_list_frame = None
         self._export_geometry = {"polylines": [], "parcels": []}
+        self._generate_after_id = None
+        self._debounce_ms = 120
 
         self._build_ui()
         self._bind_events()
@@ -102,7 +117,7 @@ class UrbanFieldGenerator:
         self._label_group(panel, T["run_mode"])
         self.controls["runMode"] = ttk.Combobox(panel, values=RUN_MODE_OPTS, state="readonly", width=36)
         self.controls["runMode"].set(RUN_MODE_OPTS[1])
-        self.controls["runMode"].pack(fill=tk.X, pady=(0, 16))
+        self.controls["runMode"].pack(fill=tk.X, pady=(0, 10))
 
         self._label_group(panel, T["site_width"])
         self.controls["siteWidth"] = tk.Entry(panel, bg="#1a1a1a", fg="#e0e0e0",
@@ -113,7 +128,7 @@ class UrbanFieldGenerator:
         self.controls["siteHeight"] = tk.Entry(panel, bg="#1a1a1a", fg="#e0e0e0",
                                                insertbackground="#e0e0e0", relief=tk.SOLID, bd=1)
         self.controls["siteHeight"].insert(0, "200")
-        self.controls["siteHeight"].pack(fill=tk.X, pady=(0, 16))
+        self.controls["siteHeight"].pack(fill=tk.X, pady=(0, 10))
 
         self._section_title(panel, T["section_field_logic"])
         self._label_group(panel, T["engine"])
@@ -207,7 +222,7 @@ class UrbanFieldGenerator:
                                                 bg="#141414", fg="#e0e0e0", troughcolor="#2a2a2a",
                                                 highlightthickness=0, showvalue=False)
         self.controls["lineSpacing"].set(40)
-        self.controls["lineSpacing"].pack(fill=tk.X, pady=(0, 16))
+        self.controls["lineSpacing"].pack(fill=tk.X, pady=(0, 10))
 
         self._label_group(panel, T["pos_count"])
         self.controls["posCount"] = tk.Entry(panel, bg="#1a1a1a", fg="#e0e0e0",
@@ -230,7 +245,7 @@ class UrbanFieldGenerator:
                                                  bg="#141414", fg="#e0e0e0", troughcolor="#2a2a2a",
                                                  highlightthickness=0, showvalue=False)
         self.controls["spacingScale"].set(1.0)
-        self.controls["spacingScale"].pack(fill=tk.X, pady=(0, 24))
+        self.controls["spacingScale"].pack(fill=tk.X, pady=(0, 14))
 
         self._section_title(panel, T["section_noise"])
         self.controls["noiseEnabled"] = tk.BooleanVar(value=False)
@@ -238,7 +253,7 @@ class UrbanFieldGenerator:
                                   command=self.update_state,
                                   bg="#141414", fg="#e0e0e0", selectcolor="#1a1a1a", activebackground="#141414",
                                   activeforeground="#e0e0e0", wraplength=350, justify=tk.LEFT)
-        noise_cb.pack(anchor="w", pady=(0, 16))
+        noise_cb.pack(anchor="w", pady=(0, 8))
 
         self._label_group(panel, T["noise_scale"], "0.005", right_key="noiseScaleVal")
         self.controls["noiseScale"] = tk.Scale(panel, from_=0.001, to=0.02, resolution=0.001, orient=tk.HORIZONTAL,
@@ -252,22 +267,48 @@ class UrbanFieldGenerator:
                                                   bg="#141414", fg="#e0e0e0", troughcolor="#2a2a2a",
                                                   highlightthickness=0, showvalue=False)
         self.controls["noiseStrength"].set(20)
-        self.controls["noiseStrength"].pack(fill=tk.X, pady=(0, 24))
+        self.controls["noiseStrength"].pack(fill=tk.X, pady=(0, 12))
 
         self._section_title(panel, T["section_street"])
+        cb_row = tk.Frame(panel, bg="#141414")
+        cb_row.pack(fill=tk.X, pady=(0, 4))
         self.controls["roadsPerpendicular"] = tk.BooleanVar(value=True)
-        perp_cb = tk.Checkbutton(panel, text=ROADS_PERP,
-                                 variable=self.controls["roadsPerpendicular"],
-                                 command=self.update_state,
-                                 bg="#141414", fg="#e0e0e0", selectcolor="#1a1a1a", activebackground="#141414",
-                                 activeforeground="#e0e0e0", wraplength=350, justify=tk.LEFT)
-        perp_cb.pack(anchor="w", pady=(0, 16))
+        tk.Checkbutton(cb_row, text="⊥", variable=self.controls["roadsPerpendicular"], command=self.update_state,
+                      bg="#141414", fg="#e0e0e0", selectcolor="#1a1a1a", activebackground="#141414",
+                      activeforeground="#e0e0e0", font=("Inter", 9)).pack(side=tk.LEFT, padx=(0, 8))
+        self.controls["roadHierarchy"] = tk.BooleanVar(value=True)
+        tk.Checkbutton(cb_row, text="Hierarchy", variable=self.controls["roadHierarchy"], command=self.update_state,
+                      bg="#141414", fg="#e0e0e0", selectcolor="#1a1a1a", activebackground="#141414",
+                      activeforeground="#e0e0e0", font=("Inter", 9)).pack(side=tk.LEFT, padx=(0, 8))
+        self.controls["adaptiveCross"] = tk.BooleanVar(value=True)
+        tk.Checkbutton(cb_row, text="Adaptive", variable=self.controls["adaptiveCross"], command=self.update_state,
+                      bg="#141414", fg="#e0e0e0", selectcolor="#1a1a1a", activebackground="#141414",
+                      activeforeground="#e0e0e0", font=("Inter", 9)).pack(side=tk.LEFT)
         self._label_group(panel, T["cross_spacing"], "80", right_key="crossVal")
         self.controls["crossSpacing"] = tk.Scale(panel, from_=40, to=300, orient=tk.HORIZONTAL,
                                                  bg="#141414", fg="#e0e0e0", troughcolor="#2a2a2a",
                                                  highlightthickness=0, showvalue=False)
         self.controls["crossSpacing"].set(80)
-        self.controls["crossSpacing"].pack(fill=tk.X, pady=(0, 16))
+        self.controls["crossSpacing"].pack(fill=tk.X, pady=(0, 4))
+        adapt_row = tk.Frame(panel, bg="#141414")
+        adapt_row.pack(fill=tk.X, pady=(0, 8))
+        adapt_row.columnconfigure((0, 1, 2), weight=1)
+        for col, (key, lbl, default) in enumerate([
+            ("curvatureWeight", "Curv", 0.4), ("attractorWeight", "Attr", 0.3), ("valueWeight", "Value", 0.2)
+        ]):
+            f = tk.Frame(adapt_row, bg="#141414")
+            f.grid(row=0, column=col, sticky="ew", padx=2)
+            tk.Label(f, text=lbl, fg="#666", bg="#141414", font=("Inter", 8)).pack(anchor="w")
+            s = tk.Scale(f, from_=0, to=1, resolution=0.1, orient=tk.HORIZONTAL,
+                        bg="#141414", fg="#e0e0e0", troughcolor="#2a2a2a", highlightthickness=0, showvalue=False,
+                        command=lambda v, k=key: self._update_adaptive_labels())
+            s.set(default)
+            s.pack(fill=tk.X)
+            self.controls[key] = s
+            val_key = {"curvatureWeight": "curvWeightVal", "attractorWeight": "attrWeightVal", "valueWeight": "valWeightVal"}[key]
+            vl = tk.Label(f, text=str(default), fg="#888", bg="#141414", font=("Inter", 8))
+            vl.pack(anchor="e")
+            self.controls[val_key] = vl
 
         self._label_group(panel, T["parcel_min"])
         self.controls["pMin"] = tk.Entry(panel, bg="#1a1a1a", fg="#e0e0e0",
@@ -279,11 +320,35 @@ class UrbanFieldGenerator:
                                          insertbackground="#e0e0e0", relief=tk.SOLID, bd=1)
         self.controls["pMax"].insert(0, "45")
         self.controls["pMax"].pack(fill=tk.X, pady=(0, 4))
-        self._label_group(panel, T["parcel_depth"])
-        self.controls["pDepth"] = tk.Entry(panel, bg="#1a1a1a", fg="#e0e0e0",
-                                          insertbackground="#e0e0e0", relief=tk.SOLID, bd=1)
-        self.controls["pDepth"].insert(0, "10")
-        self.controls["pDepth"].pack(fill=tk.X, pady=(0, 32))
+        self._label_group(panel, T["parcel_min_area"])
+        self.controls["pMinArea"] = tk.Entry(panel, bg="#1a1a1a", fg="#e0e0e0",
+                                             insertbackground="#e0e0e0", relief=tk.SOLID, bd=1)
+        self.controls["pMinArea"].insert(0, "50")
+        self.controls["pMinArea"].pack(fill=tk.X, pady=(0, 4))
+        self._label_group(panel, T["parcel_max_depth"])
+        self.controls["pMaxDepth"] = tk.Entry(panel, bg="#1a1a1a", fg="#e0e0e0",
+                                              insertbackground="#e0e0e0", relief=tk.SOLID, bd=1)
+        self.controls["pMaxDepth"].insert(0, "200")
+        self.controls["pMaxDepth"].pack(fill=tk.X, pady=(0, 8))
+
+        parcel_cb_frame = tk.Frame(panel, bg="#141414")
+        parcel_cb_frame.pack(fill=tk.X, pady=(0, 4))
+        parcel_cb_frame.columnconfigure((0, 1), weight=1)
+        for row, col, (key, lbl) in [
+            (0, 0, ("parcelFrontageBased", "Frontage")), (0, 1, ("parcelBlockByBlock", "Block")),
+            (1, 0, ("parcelCornerSeparate", "Corner")), (1, 1, ("parcelPerturbation", "Perturb"))
+        ]:
+            self.controls[key] = tk.BooleanVar(value=(key != "parcelPerturbation"))
+            tk.Checkbutton(parcel_cb_frame, text=lbl, variable=self.controls[key], command=self.update_state,
+                          bg="#141414", fg="#e0e0e0", selectcolor="#1a1a1a", activebackground="#141414",
+                          activeforeground="#e0e0e0", font=("Inter", 9)).grid(row=row, column=col, sticky="w", padx=(0, 8), pady=2)
+        self._label_group(panel, PARCEL_PERTURBATION_STR, "0.02", right_key="pertStrVal")
+        self.controls["parcelPerturbationStr"] = tk.Scale(panel, from_=0, to=0.1, resolution=0.005,
+                                                        orient=tk.HORIZONTAL, bg="#141414", fg="#e0e0e0",
+                                                        troughcolor="#2a2a2a", highlightthickness=0, showvalue=False,
+                                                        command=lambda v: self.update_state())
+        self.controls["parcelPerturbationStr"].set(0.02)
+        self.controls["parcelPerturbationStr"].pack(fill=tk.X, pady=(0, 16))
 
         btn_frame = tk.Frame(panel, bg="#141414")
         btn_frame.pack(fill=tk.X)
@@ -326,8 +391,8 @@ class UrbanFieldGenerator:
         self.status_label.place(relx=1.0, rely=1.0, anchor="se", x=-32, y=-32)
 
     def _section_title(self, parent, text, wraplength=350):
-        tk.Label(parent, text=text, font=("Inter", 12, "bold"), fg="#ffffff", bg="#141414",
-                 wraplength=wraplength, justify=tk.LEFT).pack(anchor="w", pady=(24, 8))
+        tk.Label(parent, text=text, font=("Inter", 11, "bold"), fg="#ffffff", bg="#141414",
+                 wraplength=wraplength, justify=tk.LEFT).pack(anchor="w", pady=(14, 4))
 
     def _label_group(self, parent, left, right=None, right_key=None):
         frame = tk.Frame(parent, bg="#141414")
@@ -446,6 +511,12 @@ class UrbanFieldGenerator:
         self._bind_recursive(self._engine_params_frame, self.update_state)
         self.update_state()
 
+    def _update_adaptive_labels(self):
+        for k, ctrl in [("curvWeightVal", "curvatureWeight"), ("attrWeightVal", "attractorWeight"), ("valWeightVal", "valueWeight")]:
+            if k in self.controls and ctrl in self.controls and self.controls[ctrl].winfo_exists():
+                self.controls[k].config(text=f"{self.controls[ctrl].get():.1f}")
+        self.update_state()
+
     def _update_blend_labels(self):
         if self._get_engine() != "blended":
             return
@@ -483,6 +554,7 @@ class UrbanFieldGenerator:
 
     def _get_curve_params_defaults(self):
         return {
+            "fieldType": self._get_field_type(),
             "lineSpacing": safe_float(self.controls["lineSpacing"].get(), 40),
             "posCount": safe_int(self.controls["posCount"].get(), 10),
             "negCount": safe_int(self.controls["negCount"].get(), 10),
@@ -550,6 +622,20 @@ class UrbanFieldGenerator:
 
         tk.Label(self._curve_params_inner, text=curve_n_params(idx + 1), fg="#e0e0e0", bg="#141414",
                  font=("Inter", 10, "bold")).pack(anchor="w", pady=(0, 8))
+        row_ft = tk.Frame(self._curve_params_inner, bg="#141414")
+        row_ft.pack(fill=tk.X, pady=2)
+        row_ft.columnconfigure(1, weight=1)
+        tk.Label(row_ft, text=T["field_type"], fg="#888888", bg="#141414", font=("Inter", 9), wraplength=140, justify=tk.LEFT).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ft_combo = ttk.Combobox(row_ft, values=FIELD_TYPE_OPTS, state="readonly", width=28)
+        ft_key = p.get("fieldType", self._get_field_type())
+        ft_idx = max(0, min(int(ft_key) - 1 if ft_key.isdigit() else 0, len(FIELD_TYPE_OPTS) - 1))
+        ft_combo.set(FIELD_TYPE_OPTS[ft_idx])
+        ft_combo.grid(row=0, column=1, sticky="ew")
+        def _on_ft_change(e=None):
+            sel = ft_combo.get()
+            idx = FIELD_TYPE_OPTS.index(sel) if sel in FIELD_TYPE_OPTS else 0
+            _on_change("fieldType", str(idx + 1))
+        ft_combo.bind("<<ComboboxSelected>>", _on_ft_change)
         row = tk.Frame(self._curve_params_inner, bg="#141414")
         row.pack(fill=tk.X, pady=2)
         row.columnconfigure(1, weight=1)
@@ -692,12 +778,13 @@ class UrbanFieldGenerator:
         self.status_label.config(text=T["status_default"])
         self._refresh_curve_list()
 
-    def _find_point_at(self, x, y, radius=10):
+    def _find_point_at(self, canvas_x, canvas_y, radius=10):
+        lx, ly = self._unpad(canvas_x, canvas_y)
         best_ci, best_pi, best_d = -1, -1, radius * radius
         for ci, curve in enumerate(self.custom_seed_curves):
             pts = self._get_curve_points(curve)
             for pi, (px, py) in enumerate(pts):
-                d = (x - px) ** 2 + (y - py) ** 2
+                d = (lx - px) ** 2 + (ly - py) ** 2
                 if d < best_d:
                     best_d, best_ci, best_pi = d, ci, pi
         return (best_ci, best_pi)
@@ -710,7 +797,8 @@ class UrbanFieldGenerator:
             self.drag_curve_idx = ci
             self.drag_point_idx = pi
         elif self.draw_mode and self.editing_curve_index >= 0 and self.editing_curve_index < len(self.custom_seed_curves):
-            self._get_curve_points(self.custom_seed_curves[self.editing_curve_index]).append((event.x, event.y))
+            lx, ly = self._unpad(event.x, event.y)
+            self._get_curve_points(self.custom_seed_curves[self.editing_curve_index]).append((lx, ly))
             self._refresh_curve_list()
             self.update_state()
 
@@ -718,7 +806,8 @@ class UrbanFieldGenerator:
         if self.drag_curve_idx is not None and self.drag_point_idx is not None:
             pts = self._get_curve_points(self.custom_seed_curves[self.drag_curve_idx])
             if 0 <= self.drag_point_idx < len(pts):
-                pts[self.drag_point_idx] = (event.x, event.y)
+                lx, ly = self._unpad(event.x, event.y)
+                pts[self.drag_point_idx] = (lx, ly)
                 self._refresh_curve_list()
                 self.update_state()
 
@@ -765,9 +854,21 @@ class UrbanFieldGenerator:
         self.state["noiseStrength"] = safe_float(self.controls["noiseStrength"].get(), 20)
         self.state["crossSpacing"] = safe_float(self.controls["crossSpacing"].get(), 80)
         self.state["roadsPerpendicular"] = self.controls["roadsPerpendicular"].get()
+        self.state["roadHierarchy"] = self.controls["roadHierarchy"].get() if "roadHierarchy" in self.controls else True
+        self.state["adaptiveCross"] = self.controls["adaptiveCross"].get() if "adaptiveCross" in self.controls else True
+        self.state["curvatureWeight"] = safe_float(self.controls["curvatureWeight"].get(), 0.4) if "curvatureWeight" in self.controls else 0.4
+        self.state["attractorWeight"] = safe_float(self.controls["attractorWeight"].get(), 0.3) if "attractorWeight" in self.controls else 0.3
+        self.state["valueWeight"] = safe_float(self.controls["valueWeight"].get(), 0.2) if "valueWeight" in self.controls else 0.2
         self.state["pMin"] = safe_float(self.controls["pMin"].get(), 15)
         self.state["pMax"] = safe_float(self.controls["pMax"].get(), 45)
-        self.state["pDepth"] = safe_float(self.controls["pDepth"].get(), 10)
+        self.state["pMinArea"] = safe_float(self.controls["pMinArea"].get(), 50) if "pMinArea" in self.controls else 50
+        self.state["pMaxDepth"] = safe_float(self.controls["pMaxDepth"].get(), 200) if "pMaxDepth" in self.controls else 200
+        self.state["pDepth"] = safe_float(self.controls["pDepth"].get(), 10) if "pDepth" in self.controls else 10
+        self.state["parcelFrontageBased"] = self.controls["parcelFrontageBased"].get() if "parcelFrontageBased" in self.controls else True
+        self.state["parcelBlockByBlock"] = self.controls["parcelBlockByBlock"].get() if "parcelBlockByBlock" in self.controls else True
+        self.state["parcelCornerSeparate"] = self.controls["parcelCornerSeparate"].get() if "parcelCornerSeparate" in self.controls else True
+        self.state["parcelPerturbation"] = self.controls["parcelPerturbation"].get() if "parcelPerturbation" in self.controls else False
+        self.state["parcelPerturbationStr"] = safe_float(self.controls["parcelPerturbationStr"].get(), 0.02) if "parcelPerturbationStr" in self.controls else 0.02
 
         if self.state["engine"] == "blended":
             for key, default in [("blendTangentW", 0), ("blendNormalW", 1), ("blendDecay", 0), ("blendRadius", 200)]:
@@ -785,6 +886,8 @@ class UrbanFieldGenerator:
                 if k in self.controls and v in self.state:
                     self.controls[k].config(text=str(int(self.state[v])))
 
+        if "pertStrVal" in self.controls and "parcelPerturbationStr" in self.state:
+            self.controls["pertStrVal"].config(text=f"{self.state['parcelPerturbationStr']:.3f}")
         self.controls["rotVal"].config(text=f"{self.state['seedRotation']}°")
         self.controls["seedXVal"].config(text=str(int(self.state["seedXOffset"])))
         self.controls["seedYVal"].config(text=str(int(self.state["seedYOffset"])))
@@ -794,6 +897,9 @@ class UrbanFieldGenerator:
         self.controls["noiseScaleVal"].config(text=str(self.state["noiseScale"]))
         self.controls["noiseStrVal"].config(text=str(int(self.state["noiseStrength"])))
         self.controls["crossVal"].config(text=str(int(self.state["crossSpacing"])))
+        for k, v in [("curvWeightVal", "curvatureWeight"), ("attrWeightVal", "attractorWeight"), ("valWeightVal", "valueWeight")]:
+            if k in self.controls and v in self.state:
+                self.controls[k].config(text=f"{self.state[v]:.1f}")
 
         if self.draw_mode and self.state["seedType"] != "custom":
             self._exit_draw_mode()
@@ -812,20 +918,61 @@ class UrbanFieldGenerator:
                 self.canvas.unbind("<ButtonRelease-1>")
                 self._canvas_custom_bound = False
         self.resize_canvas()
+        self._schedule_generate()
+
+    def _schedule_generate(self):
+        """Debounce: 仅在实际生成前等待最后一次变更"""
+        if self._generate_after_id:
+            self.root.after_cancel(self._generate_after_id)
+        self._generate_after_id = self.root.after(self._debounce_ms, self._do_scheduled_generate)
+
+    def _do_scheduled_generate(self):
+        self._generate_after_id = None
         self.generate()
 
     def resize_canvas(self):
         w = int(self.state["siteWidth"])
         h = int(self.state["siteHeight"])
-        self.canvas.config(width=w, height=h)
+        self.canvas.config(width=w + 2 * DRAW_PADDING, height=h + 2 * DRAW_PADDING)
+
+    def _pad(self, x, y):
+        """逻辑坐标转画布坐标"""
+        return x + DRAW_PADDING, y + DRAW_PADDING
+
+    def _unpad(self, cx, cy):
+        """画布坐标转逻辑坐标"""
+        return cx - DRAW_PADDING, cy - DRAW_PADDING
+
+    def _draw_line_segment(self, p0, p1, fill, width, dashed_outside=True):
+        """绘制线段，矩形内实线、矩形外虚线。全在内则直接绘制以加速"""
+        w, h = self.state["siteWidth"], self.state["siteHeight"]
+        x0, y0, x1, y1 = p0[0], p0[1], p1[0], p1[1]
+        in0 = 0 <= x0 <= w and 0 <= y0 <= h
+        in1 = 0 <= x1 <= w and 0 <= y1 <= h
+        if in0 and in1:
+            ax, ay = self._pad(x0, y0)
+            bx, by = self._pad(x1, y1)
+            self.canvas.create_line(ax, ay, bx, by, fill=fill, width=width)
+            return
+        parts = split_segment_inside_outside(p0, p1, 0, 0, w, h)
+        for kind, seg in parts:
+            a, b = seg[0], seg[1]
+            ax, ay = self._pad(a[0], a[1])
+            bx, by = self._pad(b[0], b[1])
+            dash = (4, 4) if (kind == "outside" and dashed_outside) else ()
+            self.canvas.create_line(ax, ay, bx, by, fill=fill, width=width, dash=dash)
 
     def generate(self):
+        if self._generate_after_id:
+            self.root.after_cancel(self._generate_after_id)
+            self._generate_after_id = None
         self.canvas.delete("all")
         s = self.state
         lines_by_curve = []
         cross_spacings = []
         eng = s.get("engine", "offset")
 
+        curve_arrays_by_curve = []
         if eng == "blended":
             curves_with_pts = [c for c in self.custom_seed_curves if len(self._get_curve_points(c)) >= 2]
             if len(curves_with_pts) >= 1:
@@ -846,6 +993,9 @@ class UrbanFieldGenerator:
                     neg_count=s.get("negCount", 10))
                 lines_by_curve = [lines] if lines else []
                 cross_spacings = [s.get("crossSpacing", 80)] * len(lines_by_curve) if lines_by_curve else []
+                pts0 = self._get_curve_points(curves_with_pts[0])
+                arr = precompute_custom_curve_arrays(pts0)
+                curve_arrays_by_curve = [(arr[0], arr[1])] if arr else []
         elif eng == "scalar":
             cx = s.get("scalarCenterX", 600)
             cy = s.get("scalarCenterY", 100)
@@ -862,34 +1012,45 @@ class UrbanFieldGenerator:
             streams = integrator.integrate_from_seeds(seeds, bounds=bounds, bidirectional=True)
             lines_by_curve = [streams] if streams else []
             cross_spacings = [s.get("crossSpacing", 80)]
+            curve_arrays_by_curve = []
         else:
             if s["seedType"] == "custom":
                 if self.custom_seed_curves:
                     for curve in self.custom_seed_curves:
                         if len(self._get_curve_points(curve)) >= 2:
+                            pts = self._get_curve_points(curve)
+                            arr = precompute_custom_curve_arrays(pts)
+                            curve_arrays_by_curve.append((arr[0], arr[1]) if arr else ([], []))
                             lines_by_curve.append(self._generate_lines_for_curve(curve))
                             p = curve.get("params", self._get_curve_params_defaults()) if isinstance(curve, dict) else {}
                             cross_spacings.append(p.get("crossSpacing", s["crossSpacing"]))
             else:
                 arr = precompute_parametric_arrays(s)
+                curve_arrays_by_curve = [(arr[0], arr[1])]
                 lines = generate_lines_from_arrays(arr, s, {})
                 lines_by_curve = [lines] if lines else []
                 cross_spacings = [s["crossSpacing"]] if lines else []
 
         if not cross_spacings:
             cross_spacings = [s["crossSpacing"]]
+        while len(curve_arrays_by_curve) < len(lines_by_curve):
+            curve_arrays_by_curve.append(([], []))
 
-        self.draw_result(lines_by_curve, cross_spacings)
+        self.draw_result(lines_by_curve, cross_spacings, curve_arrays_by_curve)
 
-    def draw_result(self, lines_by_curve, cross_spacings=None):
+    def draw_result(self, lines_by_curve, cross_spacings=None, curve_arrays_by_curve=None):
         s = self.state
         cross_spacings = cross_spacings or [s["crossSpacing"]]
+        curve_arrays_by_curve = curve_arrays_by_curve or []
         self._export_geometry = {"polylines": [], "parcels": []}
 
-        self.canvas.create_rectangle(0, 0, s["siteWidth"], s["siteHeight"],
+        pw, ph = s["siteWidth"], s["siteHeight"]
+        self.canvas.create_rectangle(DRAW_PADDING, DRAW_PADDING, DRAW_PADDING + pw, DRAW_PADDING + ph,
                                      outline="#555555", width=2, dash=(4, 4))
         curve_colors = ["#ff6600", "#66ff00", "#0066ff", "#ff00ff", "#00ffff"]
         perp = s.get("roadsPerpendicular", True)
+        use_hierarchy = s.get("roadHierarchy", True)
+        use_adaptive = s.get("adaptiveCross", True)
         main_color, main_w = "#b3b3b3", 1
         cross_color, cross_w = "#4d4d4d", 0.5
 
@@ -906,53 +1067,93 @@ class UrbanFieldGenerator:
                     pts = [(p["x"], p["y"]) for p in line]
                     self._export_geometry["polylines"].append(pts)
                     for i in range(len(pts) - 1):
-                        self.canvas.create_line(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1],
-                                               fill=color, width=width)
+                        self._draw_line_segment(pts[i], pts[i + 1], color, width)
             elif s["runMode"] in ("B", "C"):
-                for line in lines:
+                sorted_lines = sorted(lines, key=lambda ln: abs(ln[0].get("offset", 0)))
+                hierarchy = classify_longitudinal_hierarchy(lines) if use_hierarchy else []
+                line_level = {idx: level for idx, level in hierarchy}
+
+                for line_idx, line in enumerate(lines):
                     pts = [(p["x"], p["y"]) for p in line]
                     self._export_geometry["polylines"].append(pts)
-                    fill, w = (cross_color, cross_w) if perp else (main_color, main_w)
+                    if use_hierarchy and line_idx in line_level:
+                        w, fill = hierarchy_style(line_level[line_idx])
+                    else:
+                        fill, w = (cross_color, cross_w) if perp else (main_color, main_w)
                     for i in range(len(pts) - 1):
-                        self.canvas.create_line(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1],
-                                               fill=fill, width=w)
+                        self._draw_line_segment(pts[i], pts[i + 1], fill, w)
 
-                sorted_lines = sorted(lines, key=lambda ln: ln[0]["offset"])
                 cs = cross_spacings[curve_idx] if curve_idx < len(cross_spacings) else s["crossSpacing"]
-                num_sections = max(3, min(51, int(1600 / max(cs, 10))))
-                for j in range(num_sections):
-                    t = j / max(num_sections - 1, 1) if num_sections > 1 else 0
-                    idx = 0 if t <= 0 else min(int(t / T_STEP) + 1, T_COUNT - 1)
-                    cross_pts = []
-                    for line in sorted_lines:
-                        p = line[idx]
-                        cross_pts.append((p["x"], p["y"]))
+                xs, ys = ([], [])
+                if curve_idx < len(curve_arrays_by_curve):
+                    xs, ys = curve_arrays_by_curve[curve_idx]
+                value_field = None
+                cx = s.get("scalarCenterX", s["siteWidth"] / 2)
+                cy = s.get("scalarCenterY", s["siteHeight"] / 2)
+                sigma = s.get("scalarSigma", 200)
+                value_field = lambda x, y, cx=cx, cy=cy, sigma=sigma: default_land_price_field(x, y, center_x=cx, center_y=cy, sigma=sigma)
+                if use_adaptive and xs and ys:
+                    t_positions = adaptive_cross_t_positions(
+                        xs, ys, sorted_lines,
+                        base_spacing=cs,
+                        curvature_weight=s.get("curvatureWeight", 0.4),
+                        attractor_weight=s.get("attractorWeight", 0.3),
+                        value_weight=s.get("valueWeight", 0.2),
+                        attractor_x=s["siteWidth"] / 2,
+                        attractor_y=s["siteHeight"] / 2,
+                        attractor_sigma=sigma,
+                        value_field=value_field,
+                        site_width=s["siteWidth"],
+                        site_height=s["siteHeight"],
+                    )
+                else:
+                    num_sections = max(3, min(51, int(1600 / max(cs, 10))))
+                    t_positions = [j / max(num_sections - 1, 1) for j in range(num_sections)]
+
+                for t in t_positions:
+                    idx = 0 if t <= 0 else min(int(t / T_STEP), T_COUNT - 1)
+                    cross_pts = get_line_at_t(sorted_lines, t, perp=True)
+                    if len(cross_pts) < 2:
+                        continue
                     self._export_geometry["polylines"].append(cross_pts)
                     fill, w = (main_color, main_w) if perp else (cross_color, cross_w)
                     for i in range(len(cross_pts) - 1):
-                        self.canvas.create_line(cross_pts[i][0], cross_pts[i][1], cross_pts[i + 1][0], cross_pts[i + 1][1],
-                                               fill=fill, width=w)
+                        self._draw_line_segment(cross_pts[i], cross_pts[i + 1], fill, w)
 
                 if s["runMode"] == "C":
-                    segments = 15
-                    for i in range(len(sorted_lines) - 1):
-                        line_a = sorted_lines[i]
-                        line_b = sorted_lines[i + 1]
-                        for seg in range(segments):
-                            t_start = seg / segments
-                            t_end = (seg + 0.8) / segments
-                            idx_s = 0 if t_start <= 0 else min(int(t_start / T_STEP) + 1, T_COUNT - 1)
-                            idx_e = 0 if t_end <= 0 else min(int(t_end / T_STEP) + 1, T_COUNT - 1)
-                            p1, p2 = line_a[idx_s], line_b[idx_s]
-                            p3, p4 = line_b[idx_e], line_a[idx_e]
-                            parcel_pts = [(p1["x"], p1["y"]), (p2["x"], p2["y"]), (p3["x"], p3["y"]), (p4["x"], p4["y"])]
-                            self._export_geometry["parcels"].append(parcel_pts)
-                            if random.random() > 0.15:
-                                gray = int(255 * (0.05 + random.random() * 0.1))
-                                fill_color = f"#{gray:02x}{gray:02x}{gray:02x}"
-                                self.canvas.create_polygon(
-                                    p1["x"], p1["y"], p2["x"], p2["y"], p3["x"], p3["y"], p4["x"], p4["y"],
-                                    fill=fill_color, outline="#1a1a1a")
+                    use_frontage = s.get("parcelFrontageBased", True)
+                    use_block = s.get("parcelBlockByBlock", True)
+                    use_corner = s.get("parcelCornerSeparate", True)
+                    use_pert = s.get("parcelPerturbation", False)
+                    pert_str = s.get("parcelPerturbationStr", 0.02) if use_pert else 0
+                    min_f = s.get("pMin", 15)
+                    max_f = s.get("pMax", 45)
+                    min_a = s.get("pMinArea", 50)
+                    max_d = s.get("pMaxDepth", 200)
+
+                    if use_frontage and use_block:
+                        parcel_list = subdivide_blocks(
+                            sorted_lines, t_positions,
+                            min_frontage=min_f, max_frontage=max_f,
+                            min_area=min_a, max_depth=max_d,
+                            use_frontage_based=True,
+                            use_block_by_block=True,
+                            corner_parcels_separate=use_corner,
+                            perturbation_strength=pert_str,
+                            seed=hash(str(s.get("seedRotation", 0))),
+                        )
+                    else:
+                        parcel_list = rule_based_parcels(sorted_lines, segments=15)
+
+                    for parcel_pts in parcel_list:
+                        self._export_geometry["parcels"].append(parcel_pts)
+                        if random.random() > 0.15:
+                            gray = int(255 * (0.05 + random.random() * 0.1))
+                            fill_color = f"#{gray:02x}{gray:02x}{gray:02x}"
+                            pad_pts = [self._pad(x, y) for x, y in parcel_pts]
+                            flat = [c for p in pad_pts for c in p]
+                            self.canvas.create_polygon(
+                                *flat, fill=fill_color, outline="#1a1a1a")
 
         if s["seedType"] == "custom" and self.custom_seed_curves:
             colors = ["#ff6600", "#66ff00", "#0066ff", "#ff00ff", "#00ffff"]
@@ -960,21 +1161,21 @@ class UrbanFieldGenerator:
                 pts = self._get_curve_points(curve)
                 if len(pts) < 2:
                     for x, y in pts:
-                        self.canvas.create_oval(x - 5, y - 5, x + 5, y + 5, fill="#ff3300", outline="#ffffff")
+                        cx, cy = self._pad(x, y)
+                        self.canvas.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, fill="#ff3300", outline="#ffffff")
                     continue
                 color = colors[ci % len(colors)]
                 curve_pts = sample_curve(pts)
                 for i in range(len(curve_pts) - 1):
-                    x1, y1 = curve_pts[i]
-                    x2, y2 = curve_pts[i + 1]
-                    self.canvas.create_line(x1, y1, x2, y2, fill=color, width=2)
+                    self._draw_line_segment(curve_pts[i], curve_pts[i + 1], color, 2)
                 for x, y in pts:
-                    self.canvas.create_oval(x - 5, y - 5, x + 5, y + 5, fill=color, outline="#ffffff")
+                    cx, cy = self._pad(x, y)
+                    self.canvas.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, fill=color, outline="#ffffff")
 
     def _bind_events(self):
         for key, ctrl in self.controls.items():
             if key in ("rotVal", "spacingVal", "scaleVal", "noiseScaleVal", "noiseStrVal", "crossVal",
-                       "seedXVal", "seedYVal", "seedLenVal"):
+                       "seedXVal", "seedYVal", "seedLenVal", "curvWeightVal", "attrWeightVal", "valWeightVal"):
                 continue
             if isinstance(ctrl, tk.Scale):
                 ctrl.config(command=lambda v, k=key: self.update_state())
@@ -1018,6 +1219,22 @@ class UrbanFieldGenerator:
         self.controls["negCount"].delete(0, tk.END)
         self.controls["negCount"].insert(0, "10")
         self.controls["noiseEnabled"].set(False)
+        if "pMinArea" in self.controls:
+            self.controls["pMinArea"].delete(0, tk.END)
+            self.controls["pMinArea"].insert(0, "50")
+        if "pMaxDepth" in self.controls:
+            self.controls["pMaxDepth"].delete(0, tk.END)
+            self.controls["pMaxDepth"].insert(0, "200")
+        if "parcelFrontageBased" in self.controls:
+            self.controls["parcelFrontageBased"].set(True)
+        if "parcelBlockByBlock" in self.controls:
+            self.controls["parcelBlockByBlock"].set(True)
+        if "parcelCornerSeparate" in self.controls:
+            self.controls["parcelCornerSeparate"].set(True)
+        if "parcelPerturbation" in self.controls:
+            self.controls["parcelPerturbation"].set(False)
+        if "parcelPerturbationStr" in self.controls:
+            self.controls["parcelPerturbationStr"].set(0.02)
         self.update_state()
 
     def run(self):
