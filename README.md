@@ -39,7 +39,7 @@
 cd strip-field
 
 # 直接运行（无需额外依赖）
-python urban_field_gen.py
+python main.py
 ```
 
 ## 使用说明
@@ -55,16 +55,30 @@ python urban_field_gen.py
 
 ```
 strip-field/
-├── urban_field_gen.py   # 主程序入口
-├── requirements.txt    # 可选依赖（DXF 导出需 ezdxf）
-├── output.svg           # 示例输出
-├── flow.svg
-├── output_b.svg
-├── output_c.svg
-├── test_curve.svg
-├── .gitignore
+├── main.py              # 程序入口
+├── app.py               # 主应用类 UrbanFieldGenerator（UI + 逻辑编排）
+├── config.py            # 配置常量（T_STEP, T_COUNT）
+├── utils.py             # 工具函数（lerp, noise, safe_float, safe_int）
+├── geom.py              # 几何裁剪（线段/折线/多边形裁剪到矩形）
+├── curve.py             # 曲线插值（Catmull-Rom 样条、弧长采样）
+├── field_generator.py   # 向量场生成逻辑（预计算、扩张线生成）
+├── engines/             # 向量场引擎模块
+│   ├── offset_field_engine.py   # A. OffsetFieldEngine（原有 7 种模式）
+│   ├── blended_field_engine.py  # B. BlendedFieldEngine（多母线叠加、距离衰减、切向/法向混合）
+│   ├── scalar_field_engine.py   # C. ScalarFieldEngine（标量场→梯度场→垂直流线）
+│   └── streamline_integrator.py # D. StreamlineIntegrator（Euler/RK4 流线积分）
+├── exporter.py          # 导出逻辑（RhinoScript、DXF）
+├── urban_field_gen.py   # 旧版单文件（保留作参考）
+├── requirements.txt     # 可选依赖（DXF 导出需 ezdxf）
 └── README.md
 ```
+
+## 引擎架构
+
+- **A. OffsetFieldEngine**：保留原有逻辑，支持 parallel、tangent_drift、normal_band、contour_bulge、strip_growth、hybrid、noise_modified 七种模式。
+- **B. BlendedFieldEngine**：多母线叠加、距离衰减、tangent/normal 加权混合，适合多条曲线共同影响场。
+- **C. ScalarFieldEngine**：从标量场（如地价）生成梯度场，再生成垂直于梯度的流线，适合等高线逻辑。
+- **D. StreamlineIntegrator**：支持 Euler / RK4 积分，从 seed points 积分出真正流线。
 
 ## 技术说明
 
